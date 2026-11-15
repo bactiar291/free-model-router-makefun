@@ -188,6 +188,27 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(out.stdout, b'{"providers":[]}\n')
         self.assertEqual(out.stderr, b"")
 
+    def test_ranking_does_not_treat_call_count_as_hidden_budget(self):
+        providers = [{"id": "a"}, {"id": "b"}]
+        router = main.Router(None, ({"providers": providers}, {"ratings": []}, {"manifest": []}))
+        candidates = [{"provider": "a", "model": "strong", "rating_milli": 1500},
+                      {"provider": "b", "model": "other", "rating_milli": 1490}]
+        router.calls["a"] = 100
+        router.refusals["a"] = 20
+        self.assertEqual(router.rank(candidates, {}, 1)[0]["model"], "strong")
+
+    def test_future_specialist_reservation_and_current_weight(self):
+        providers = [{"id": "a", "wire": "openai"}, {"id": "b", "wire": "openai"}]
+        router = main.Router(None, ({"providers": providers}, {"ratings": []}, {
+            "manifest": [{"requires": {"vision": True}, "weight": 2}]}))
+        router.candidates = [{"provider": p["id"], "provider_obj": p, "model": p["id"],
+            "rating_milli": rating, "vision": vision} for p, rating, vision in
+            ((providers[0], 1500, True), (providers[1], 1485, False))]
+        self.assertEqual(router.rank(router.candidates, {}, 1)[0]["provider"], "b")
+        self.assertEqual(router.rank(router.candidates, {}, 2)[0]["provider"], "a")
+        router.manifest = []
+        self.assertEqual(router.rank(router.candidates, {}, 1)[0]["provider"], "a")
+
     def test_full_error_envelopes(self):
         self.assertEqual(main.error_body("openai", 503, "no_available_model", "unavailable"),
             {"error": {"message": "unavailable", "type": "overloaded_error", "param": None, "code": "no_available_model"}})

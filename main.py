@@ -223,16 +223,18 @@ class Router:
                 and not (json_mode and r["provider_obj"]["wire"] == "anthropic")]
 
     def rank(self, candidates, requirements, weight):
-        """Conservative opportunity cost, without guessing hidden quotas.
+        """Rank weighted quality with a conservative future opportunity cost.
 
         For each future job, measure the quality lost if a provider disappears.
         Weight that advantage by the job's public weight. The largest advantage
         reserves specialists (vision and long context) and premium models for
         heavy work. Recompute after every observed permanent refusal.
 
-        Calls create a small, capped uncertainty penalty: diversify near-equal
-        providers but never trade a large known quality gap for an assumed quota.
-        Integer arithmetic and identity tie breaks make ordering reproducible.
+        Call counts alone do not establish exhaustion: penalizing successful
+        providers spreads traffic into more failure schedules and can lower
+        quality. Keep temporary refusals eligible for later requests; retire
+        providers only on explicit permanent signals in serve(). Integer
+        arithmetic and identity tie breaks make ordering reproducible.
         """
         reserve = {p["id"]: 0 for p in self.providers}
         for future in self.manifest[self.index:]:
@@ -248,9 +250,8 @@ class Router:
 
         def utility(row):
             pid = row["provider"]
-            exposure = min(24, self.calls[pid] * 3 + self.refusals[pid] * 2)
             opportunity = min(160, reserve[pid])
-            return row["rating_milli"] * weight * 8 - exposure * 8 - opportunity
+            return row["rating_milli"] * weight * 8 - opportunity
 
         return sorted(candidates, key=lambda r: (-utility(r), -r["rating_milli"], r["provider"], r["model"]))
 

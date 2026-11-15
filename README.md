@@ -36,7 +36,7 @@ Endpoints:
 
 Catalogs establish availability and free flags; the prompt supplies rating_milli and capabilities. Authentication follows each provider's declared scheme independently of its wire. Provider URLs must remain on the supplied env origin under /p/. HTTP redirects and proxy environment variables are not used.
 
-The router filters capabilities and JSON-wire compatibility before ranking. Its integer utility combines the current request's weighted rating, a small capped penalty for observed calls/refusals, and the largest future weighted quality advantage a provider offers over alternatives. This preserves scarce vision/long-context options and values high-weight work without assuming hidden budgets or schedules. Stable provider/model IDs break ties. All provider calls are sequential.
+The router filters capabilities and JSON-wire compatibility before ranking. Its integer utility combines the current request's weighted rating with the largest future weighted quality advantage a provider offers over alternatives. This preserves scarce vision/long-context options and values high-weight work without assuming hidden budgets or schedules. It does not penalize a provider merely because earlier calls succeeded: development and independent holdout testing found that such penalties lowered quality and increased refusal calls. Stable provider/model IDs break ties. All provider calls are sequential.
 
 A refusal fails over to another eligible provider. Explicit exhausted-budget/outage messages or permanent auth errors retire a provider; temporary rate, payment, queue, and concurrency refusals do not. A successful inference is never replaced with a second inference. Malformed successful responses produce an error instead of fabricated content.
 
@@ -58,15 +58,17 @@ The runner invokes program/env/server.mjs, program/scorer/score.mjs, and optiona
 
 Each repeat uses a fresh env and port. The runner checks exit status, workload completion, --list stability before/after work, catalog equality with registration, official scorer output, and exact state.json byte equality. Extra practice seeds are SHA-256 hashes of public test labels, generated solely in the test parent and never passed to the router.
 
-Measured after the workload-aware routing revision:
+Measured after the quality-first routing revision:
 
 | Practice | Score | Quality | Served | Wire | Failover | Catalog | Calls |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | trial-0 | 99 | 99 | 100 | 100 | 100 | 100 | 26 |
-| trial-1 | 99 | 99 | 100 | 100 | 100 | 100 | 28 |
-| trial-2 | 99 | 99 | 100 | 100 | 100 | 100 | 30 |
+| trial-1 | 99 | 99 | 100 | 100 | 100 | 100 | 29 |
+| trial-2 | 99 | 99 | 100 | 100 | 100 | 100 | 29 |
 
-All three state exports matched across two runs. Eight additional generated public practice seeds also scored 99 with 100 served/wire/failover/catalog and matching repeated exports. These are real local public-scorer results, not official submission or transcript-gate verdicts.
+A bounded policy comparison used 32 generated development instances and then 64 disjoint holdout instances. The candidate was frozen before holdout evaluation. On development, mean calls decreased from 28.125 to 27.28125 and unrounded weighted quality rose from 99.724169% to 99.754971%. On holdout, mean calls decreased from 27.390625 to 26.671875 and unrounded quality rose from 99.765756% to 99.798641%. All scores remained 99; served/wire/failover/catalog were 100 throughout. Baseline and candidate each ran twice on every holdout instance and official trial, with exact repeated state bytes and successful exits.
+
+The candidate used fewer calls on 35 holdout seeds, the same on 17, and more on 12. This improves measured expected tie-breaking performance but does not dominate every seed; an exact tie still favors the earlier submitted baseline. Quality 100 was not achieved. These are real local public-scorer results, not official submission or transcript-gate verdicts.
 
 ## Limits
 
