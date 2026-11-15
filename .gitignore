@@ -1,0 +1,36 @@
+# Secrets and account material
+.env
+.env.*
+*.pem
+*.key
+*.keypair
+*keypair*.json
+*credentials*
+wallet*.json
+secrets/
+keys/
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Trial outputs and native transcripts stay outside the entry
+trial-outputs/
+router-tests-*/
+output/
+state/
+scores/
+*.log
+*.ndjson
+transcripts/
+*transcript*.json
+*transcript*.jsonl
+*transcript*.tar.gz
+sessions/
+*.tar.gz
+.DS_Store
