@@ -216,6 +216,73 @@ class RouterTests(unittest.TestCase):
             {"type": "error", "error": {"type": "invalid_request_error", "message": "invalid"}})
 
 
+class PlannerTests(unittest.TestCase):
+    def test_assignment_matches_exhaustive_small_problem(self):
+        import itertools
+        matrices = [[[3, 1, 5], [2, 4, 1]], [[9, 2, 7, 8], [6, 4, 3, 7], [5, 8, 1, 8]],
+                    [[0, 0, 0], [0, 0, 0]]]
+        for costs in matrices:
+            assigned = main.Router.assignment(costs)
+            self.assertEqual(len(set(assigned)), len(costs))
+            actual = sum(costs[i][j] for i, j in enumerate(assigned))
+            expected = min(sum(costs[i][j] for i, j in enumerate(columns))
+                           for columns in itertools.permutations(range(len(costs[0])), len(costs)))
+            self.assertEqual(actual, expected)
+            self.assertEqual(assigned, main.Router.assignment(costs))
+
+    def router(self):
+        providers = [{'id': p, 'wire': 'openai', 'auth': 'none', 'dial_path': '/p/' + p} for p in ('a', 'b')]
+        jobs = [{'id': 'r1', 'weight': 1, 'api': 'openai', 'requires': {}},
+                {'id': 'r2', 'weight': 2, 'api': 'openai', 'requires': {'vision': True}}]
+        router = main.Router(None, ({'providers': providers}, {'ratings': [], 'best': [
+            {'id': 'r1', 'rating_milli': 1500}, {'id': 'r2', 'rating_milli': 1500}]}, {'manifest': jobs}))
+        router.candidates = [{'provider': p['id'], 'provider_obj': p, 'model': p['id'],
+                             'rating_milli': rating, 'vision': vision} for p, rating, vision in
+                            ((providers[0], 1500, True), (providers[1], 1490, False))]
+        return router
+
+    def test_plan_reserves_unique_vision_and_respects_attempts(self):
+        router = self.router()
+        router.index = 1
+        self.assertEqual(router.planned(router.candidates, {}, 1, set())['provider'], 'b')
+        self.assertEqual(router.planned(router.candidates, {}, 1, {'b'})['provider'], 'a')
+        router.quality_spent = router.quality_bound * 18 // 1000
+        self.assertEqual(router.planned(router.candidates, {}, 1, set())['provider'], 'a')
+
+    def test_temporary_recovery_never_repeats_success_or_permanent_error(self):
+        for permanent in (False, True):
+            router = self.router()
+            router.manifest = []
+            router.quality_bound = 0
+            class Replies:
+                def __init__(self):
+                    self.paths = []
+                def request(self, path, body, headers):
+                    self.paths.append(path)
+                    if len(self.paths) == 1 and permanent:
+                        return 429, b'{"error":{"code":"rate_limit","message":"Provider is out"}}'
+                    if len(self.paths) <= 2:
+                        return 429, b'{"error":{"code":"rate_limit","message":"Provider refused this call"}}'
+                    value = {'id': 'real-upstream-fixture', 'model': body['model'],
+                             'choices': [{'message': {'role': 'assistant', 'content': 'upstream answer'}, 'finish_reason': 'stop'}],
+                             'usage': {'prompt_tokens': 3, 'completion_tokens': 4}}
+                    return 200, wire.dumps(value).encode()
+            transport = Replies()
+            router.transport = transport
+            answer = router.serve({'messages': [{'role': 'user', 'content': 'question'}]}, 'openai', '2023-06-01')
+            self.assertEqual(answer['content'], [{'type': 'text', 'text': 'upstream answer'}])
+            self.assertEqual(len(transport.paths), 3)
+            self.assertEqual(transport.paths[-1], '/p/b/v1/chat/completions' if permanent else '/p/a/v1/chat/completions')
+
+    def test_first_slot_prior_and_observed_failure_update(self):
+        router = self.router()
+        self.assertEqual(router.slot_risk('a', 0), 0)
+        router.calls['a'] = 2
+        before = router.slot_risk('a', 0)
+        router.refusals['a'] = 1
+        self.assertLess(router.slot_risk('a', 0), before)
+
+
 class HttpTests(unittest.TestCase):
     def test_invalid_requests_have_wire_errors_and_no_inference(self):
         class NoInference:

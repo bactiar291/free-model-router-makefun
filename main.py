@@ -180,6 +180,9 @@ class Router:
         self.calls = {p["id"]: 0 for p in self.providers}
         self.refusals = {p["id"]: 0 for p in self.providers}
         self.serve_lock = threading.Lock()
+        self.quality_spent = 0
+        self.best = {r['id']: r['rating_milli'] for r in quality.get('best', [])}
+        self.quality_bound = sum(r.get('weight', 1) * self.best.get(r.get('id'), 0) for r in self.manifest)
 
     def load(self):
         for provider in self.providers:
@@ -255,6 +258,138 @@ class Router:
 
         return sorted(candidates, key=lambda r: (-utility(r), -r["rating_milli"], r["provider"], r["model"]))
 
+    # Public distribution bounds from program/generator/draw.mjs, not instance
+    # budgets. No seed, failure positions, or outage identity is known here.
+    BUDGET_PRIORS = {'groq': (9, 12), 'cerebras': (5, 6), 'gemini': (6, 8),
+                     'zai': (4, 5), 'openrouter': (10, 12), 'sambanova': (4, 5),
+                     'pollinations': (10, 14), 'cloudflare': (7, 8),
+                     'ovh': (5, 6), 'kilol': (12, 16)}
+
+    def slot_risk(self, pid, offset):
+        """Conservative expected refusal cost for an additional provider call.
+
+        The first inference has no scheduled failure. Later slots combine the
+        public failure-position and outage distributions; cumulative call count
+        only estimates risk, never certifies remaining budget. Observed refusals
+        reduce the estimated remaining scheduled failures; explicit permanent
+        errors remain hard exclusions. This is a prior, not instance knowledge.
+        """
+        number = self.calls[pid] + offset + 1
+        if number == 1:
+            return 0
+        lo, hi = self.BUDGET_PRIORS.get(pid, (4, 8))
+        risk = 0.0
+        for budget in range(lo, hi + 1):
+            if number > budget:
+                chance = 1.0
+            else:
+                remaining_failures = max(0.25, 1.5 - self.refusals[pid])
+                scheduled = remaining_failures / max(1, budget - 2) if number < budget else 0.0
+                designated = 0.1 if number == 2 else 0.0
+                outage = 0.1 * min(1.0, (number - 1) / max(1, budget - 2))
+                chance = 1 - (1 - scheduled) * (1 - designated) * (1 - outage)
+            risk += chance / (hi - lo + 1)
+        # Convex usage cost prevents a later cheap slot bypassing earlier risk.
+        return round(1000 * risk) + offset * 15
+
+    @staticmethod
+    def assignment(costs):
+        """Rectangular Hungarian assignment with deterministic column ties."""
+        n, m = len(costs), len(costs[0])
+        u, v, p, way = [0] * (n + 1), [0] * (m + 1), [0] * (m + 1), [0] * (m + 1)
+        for i in range(1, n + 1):
+            p[0], j0 = i, 0
+            minimum, used = [10**18] * (m + 1), [False] * (m + 1)
+            while True:
+                used[j0] = True
+                i0, delta, j1 = p[j0], 10**18, 0
+                for j in range(1, m + 1):
+                    if not used[j]:
+                        cur = costs[i0 - 1][j - 1] - u[i0] - v[j]
+                        if cur < minimum[j]:
+                            minimum[j], way[j] = cur, j0
+                        if minimum[j] < delta:
+                            delta, j1 = minimum[j], j
+                for j in range(m + 1):
+                    if used[j]:
+                        u[p[j]] += delta
+                        v[j] -= delta
+                    else:
+                        minimum[j] -= delta
+                j0 = j1
+                if p[j0] == 0:
+                    break
+            while True:
+                j1 = way[j0]
+                p[j0] = p[j1]
+                j0 = j1
+                if j0 == 0:
+                    break
+        result = [0] * n
+        for j in range(1, m + 1):
+            if p[j]:
+                result[p[j] - 1] = j - 1
+        return result
+
+    def planned(self, candidates, requirements, weight, attempted):
+        """Receding-horizon risk allocation subject to a real quality floor.
+
+        A Lagrange multiplier finds a low-risk remaining assignment within the
+        weighted quality-loss allowance. Only the first assignment is executed;
+        future assignments are recomputed from actual responses. The planner
+        never changes a request or synthesizes an answer to meet its target.
+        """
+        if not self.quality_bound or not candidates:
+            return None
+        current = self.manifest[self.index - 1]
+        jobs = [dict(current, requires=requirements, weight=weight)] + self.manifest[self.index:]
+        options = []
+        for i, job in enumerate(jobs):
+            eligible = candidates if i == 0 else self.eligible(job['requires'], job['api'] == 'openai' and job['requires'].get('json', False))
+            by_provider = {}
+            for row in eligible:
+                pid = row['provider']
+                if pid in self.dead or (i == 0 and pid in attempted):
+                    continue
+                previous = by_provider.get(pid)
+                if previous is None or (-row['rating_milli'], row['model']) < (-previous['rating_milli'], previous['model']):
+                    by_provider[pid] = row
+            if not by_provider:
+                return None
+            options.append(by_provider)
+        providers = sorted({pid for option in options for pid in option})
+        slots = [(pid, k) for pid in providers for k in range(len(jobs))]
+        risks = []
+        for pid in providers:
+            highest = 0
+            for k in range(len(jobs)):
+                highest = max(highest, self.slot_risk(pid, k))
+                risks.append(highest)
+        loss = [[(self.best[job['id']] - option[pid]['rating_milli']) * job['weight']
+                 if pid in option else 10**8 for pid, _ in slots] for job, option in zip(jobs, options)]
+        # Reserve two tenths of a percentage point for late capability loss.
+        allowance = self.quality_bound * 18 // 1000 - self.quality_spent
+
+        def solve(multiplier):
+            costs = [[(risks[j] * 100 + value * multiplier) if value < 10**8 else 10**14
+                      for j, value in enumerate(row)] for row in loss]
+            chosen = self.assignment(costs)
+            return chosen, sum(loss[i][j] for i, j in enumerate(chosen))
+
+        chosen, spent = solve(0)
+        if spent > allowance:
+            lo, hi = 0, 1000000
+            chosen, spent = solve(hi)
+            if spent <= allowance:
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    proposal, cost = solve(mid)
+                    if cost <= allowance:
+                        hi, chosen = mid, proposal
+                    else:
+                        lo = mid
+        return options[0].get(slots[chosen[0]][0])
+
     def serve(self, body, api, version):
         with self.serve_lock:
             manifest = self.manifest[self.index] if self.index < len(self.manifest) else {"requires": {}, "weight": 1}
@@ -270,7 +405,17 @@ class Router:
                 requirements["json"] = True
             candidates = self.rank(self.eligible(requirements, json_mode), requirements, manifest.get("weight", 1))
             attempted = set()
-            for row in candidates:
+            retryable = set()
+            recovery = False
+            while True:
+                available = [r for r in candidates if r['provider'] not in attempted and r['provider'] not in self.dead]
+                if not available:
+                    if not recovery and retryable - self.dead:
+                        recovery = True
+                        attempted.difference_update(retryable)
+                        continue
+                    break
+                row = self.planned(available, requirements, manifest.get('weight', 1), attempted) or available[0]
                 provider = row["provider_obj"]
                 pid, wire = row["provider"], provider["wire"]
                 if pid in attempted or pid in self.dead:
@@ -305,11 +450,15 @@ class Router:
                     self.refusals[pid] += 1
                     if kind == "permanent":
                         self.dead.add(pid)
+                    elif kind == "temporary":
+                        retryable.add(pid)
                     continue
                 # A successful inference is never replaced by a second one. If its
                 # wire is corrupt, report the failure instead of inventing content.
                 try:
-                    return decode_answer(raw, wire, stream, row["model"])
+                    answer = decode_answer(raw, wire, stream, row["model"])
+                    self.quality_spent += max(0, self.best.get(manifest.get('id'), row['rating_milli']) - row['rating_milli']) * manifest.get('weight', 1)
+                    return answer
                 except (ValueError, KeyError, TypeError, IndexError):
                     raise WireError(502, "invalid_upstream_response", "provider returned an invalid or incomplete response") from None
             raise WireError(503, "no_available_model", "no available free provider can serve this request")
